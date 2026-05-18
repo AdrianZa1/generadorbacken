@@ -2,14 +2,17 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
-import { pathToFileURL } from 'url';
+import { pathToFileURL, fileURLToPath } from 'url';
 import fs from 'fs/promises';
 import os from 'os';
 import puppeteer from 'puppeteer';
+import { PDFDocument } from 'pdf-lib';
 
 dotenv.config();
 
 const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // CORS: allow specific origins via ALLOWED_ORIGINS env (comma-separated), otherwise allow all
 const allowedEnv = process.env.ALLOWED_ORIGINS;
@@ -22,6 +25,9 @@ app.use(cors({ origin: (origin, cb) => {
 }}));
 
 app.use(express.json({ limit: '20mb' }));
+
+// Serve frontend static files from ../docs
+app.use(express.static(path.resolve(__dirname, '..', 'docs')));
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 if (!OPENAI_KEY) {
@@ -87,5 +93,64 @@ app.post('/generate-pdf', async (req, res) => {
   }
 });
 
+// Merge base PDF and attachments server-side
+app.post('/merge-pdfs', async (req, res) => {
+  try {
+    const { basePdf, attachments } = req.body;
+    if (!basePdf) return res.status(400).json({ error: 'basePdf required' });
+
+    const toBuffer = (input) => {
+      if (!input) return null;
+      const s = String(input || '');
+      if (s.startsWith('data:')) {
+        const parts = s.split(',');
+        return Buffer.from(parts[1] || '', 'base64');
+      }
+      return Buffer.from(s, 'base64');
+    };
+
+    const baseBuf = toBuffer(basePdf);
+    if (!baseBuf) return res.status(400).json({ error: 'invalid basePdf' });
+
+    const baseDoc = await PDFDocument.load(baseBuf);
+
+    for (const att of (attachments || [])) {
+      try {
+        const attBuf = toBuffer(att.fileData || att.data || '');
+        if (!attBuf) continue;
+        const attDoc = await PDFDocument.load(attBuf);
+        const copied = await baseDoc.copyPages(attDoc, attDoc.getPageIndices());
+        copied.forEach(p => baseDoc.addPage(p));
+      } catch (e) {
+        console.error('Failed to append attachment', e, att && att.fileName);
+      }
+    }
+
+    const merged = await baseDoc.save();
+    const outBuf = Buffer.from(merged);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename=Mi_CV_con_adjuntos.pdf');
+    res.setHeader('Content-Length', outBuf.length);
+    res.end(outBuf);
+  } catch (err) {
+    console.error('merge-pdfs error', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// Health check for platform health checks
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime(), time: new Date().toISOString() });
+});
+
+// Basic root info
+app.get('/', (req, res) => {
+  res.type('text').send('Asistente CV backend. Endpoints: /api/gpt, /generate-pdf, /health');
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend API running on http://localhost:${PORT}`));
+const allowedStr = allowedList ? allowedList.join(',') : 'any';
+app.listen(PORT, () => {
+  console.log(`Backend API running on http://localhost:${PORT}`);
+  console.log(`CORS allowed origins: ${allowedStr}`);
+});
